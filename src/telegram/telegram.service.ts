@@ -1,15 +1,24 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { InjectRepository } from '@nestjs/typeorm';
+import { Repository } from 'typeorm';
 import * as TelegramBot from 'node-telegram-bot-api';
 import * as moment from 'moment-timezone';
+import { TimerEntity } from './entities/timer.entity';
+
+interface Timer {
+  id: string;
+  eventDate: moment.Moment;
+  chatId: TelegramBot.ChatId;
+  pinnedMessageId: number | null;
+  isRunning: boolean;
+}
 
 @Injectable()
 export class TelegramService implements OnModuleInit {
   private bot: TelegramBot;
-  private eventDate: moment.Moment | null = null;
-  private pinnedMessageId: number | null = null;
-  private chatId: TelegramBot.ChatId | null = null;
   private readonly timezone: string;
+  private timers: Map<string, Timer> = new Map();
   private dateTimeState: {
     [key: string]: {
       year?: number;
@@ -17,14 +26,19 @@ export class TelegramService implements OnModuleInit {
       day?: number;
       hour?: number;
       minute?: number;
+      timerId?: string;
     };
   } = {};
 
-  constructor(private configService: ConfigService) {
+  constructor(
+    private configService: ConfigService,
+    @InjectRepository(TimerEntity)
+    private timerRepository: Repository<TimerEntity>,
+  ) {
     this.timezone = this.configService.get<string>('TIMEZONE') || 'Europe/Moscow';
   }
 
-  onModuleInit() {
+  async onModuleInit() {
     const token = this.configService.get<string>('TELEGRAM_BOT_TOKEN');
 
     if (!token) {
@@ -33,12 +47,168 @@ export class TelegramService implements OnModuleInit {
 
     this.bot = new TelegramBot(token, { polling: true });
 
+    // Восстанавливаем таймеры при запуске
+    await this.restoreTimers();
+
+    // Устанавливаем команды бота
+    this.bot.setMyCommands([
+      {
+        command: '/start',
+        description: 'Начать работу с ботом',
+      },
+      {
+        command: '/setdate',
+        description: 'Создать новый таймер через интерактивное меню',
+      },
+      {
+        command: '/mytimers',
+        description: 'Показать все активные таймеры',
+      },
+      {
+        command: '/cleartimer',
+        description: 'Удалить таймер',
+      },
+      {
+        command: '/help',
+        description: 'Показать справку по командам',
+      },
+    ]);
+
+    // Обновляем текст справки
+    this.bot.onText(/\/help/, (msg) => {
+      this.handleErrors(async () => {
+        const helpText =
+          '🤖 *Справка по командам*\n\n' +
+          '📋 *Основные команды:*\n' +
+          '▫️ /start - Начать работу с ботом\n' +
+          '▫️ /setdate - Создать новый таймер через удобное меню\n' +
+          '▫️ /mytimers - Показать список всех ваших активных таймеров\n' +
+          '▫️ /cleartimer - Удалить таймер (можно указать ID: /cleartimer ID)\n' +
+          '▫️ /help - Показать это сообщение\n\n' +
+          '📝 *Дополнительные возможности:*\n' +
+          '▫️ Можно установить таймер вручную: /setdate ДД.ММ.ГГГГ ЧЧ:ММ\n' +
+          '▫️ Пример: /setdate 31.12.2024 23:59\n' +
+          '▫️ Каждый таймер имеет свой ID для управления\n' +
+          '▫️ Можно создавать несколько таймеров одновременно\n\n' +
+          '⚡️ *Подсказки:*\n' +
+          '▫️ Используйте /mytimers для просмотра ID ваших таймеров\n' +
+          '▫️ При удалении таймера без указания ID появится меню выбора';
+
+        await this.bot.sendMessage(msg.chat.id, helpText, {
+          parse_mode: 'Markdown',
+          disable_web_page_preview: true,
+        });
+      });
+    });
+
+    // Обновляем приветственное сообщение
     this.bot.onText(/\/start/, (msg) => {
       this.handleErrors(async () => {
+        const welcomeText =
+          '👋 Привет! Я бот для управления таймерами\n\n' +
+          '🔥 *Что я умею:*\n' +
+          '▫️ Создавать несколько таймеров\n' +
+          '▫️ Показывать оставшееся время\n' +
+          '▫️ Уведомлять когда время истекло\n\n' +
+          '🚀 *Начало работы:*\n' +
+          '1️⃣ Используйте /setdate для создания таймера\n' +
+          '2️⃣ /mytimers покажет все ваши таймеры\n' +
+          '3️⃣ /help расскажет обо всех возможностях\n\n' +
+          '✨ Готовы начать? Нажмите /setdate!';
+
+        await this.bot.sendMessage(msg.chat.id, welcomeText, {
+          parse_mode: 'Markdown',
+          disable_web_page_preview: true,
+        });
+      });
+    });
+
+    // Обновляем метод mytimers
+    this.bot.onText(/\/mytimers/, (msg) => {
+      this.handleErrors(async () => {
+        const userTimers = Array.from(this.timers.values())
+          .filter(timer => timer.chatId === msg.chat.id);
+
+        if (userTimers.length === 0) {
+          await this.bot.sendMessage(msg.chat.id, '❌ У вас нет активных таймеров');
+          return;
+        }
+
+        const timersList = userTimers.map((timer, index) => {
+          const remaining = moment.duration(timer.eventDate.diff(moment()));
+          let timeLeft = '';
+          
+          if (remaining.years() > 0) timeLeft += `${remaining.years()}г `;
+          if (remaining.months() > 0) timeLeft += `${remaining.months()}м `;
+          if (remaining.days() > 0) timeLeft += `${remaining.days()}д `;
+          if (remaining.hours() > 0) timeLeft += `${remaining.hours()}ч `;
+          if (remaining.minutes() > 0) timeLeft += `${remaining.minutes()}мин `;
+          timeLeft += `${remaining.seconds()}с`;
+
+          return `${index + 1}. 📅 ${timer.eventDate.format('DD.MM.YYYY HH:mm')}\n⏳ Осталось: ${timeLeft}`;
+        }).join('\n\n');
+
+        await this.bot.sendMessage(msg.chat.id, 
+          '📋 *Ваши активные таймеры:*\n\n' + timersList + 
+          '\n\n_Используйте /cleartimer для удаления таймера_', {
+          parse_mode: 'Markdown'
+        });
+      });
+    });
+
+    // Обновляем обработчик установки таймера
+    this.bot.onText(/\/setdate (\d{2})\.(\d{2})\.(\d{4}) (\d{2}):(\d{2})/, (msg, match) => {
+      this.handleErrors(async () => {
+        if (!match) return;
+
+        const [_, day, month, year, hours, minutes] = match;
+        const eventDate = moment.tz(
+          `${year}-${month}-${day} ${hours}:${minutes}:00`,
+          'YYYY-MM-DD HH:mm:ss',
+          this.timezone,
+        );
+
+        if (!eventDate.isValid()) {
+          await this.bot.sendMessage(
+            msg.chat.id,
+            'Неправильный формат даты. Используйте /setdate для выбора даты или формат ДД.ММ.ГГГГ ЧЧ:ММ',
+          );
+          return;
+        }
+
+        const timerId = await this.createTimer(eventDate, msg.chat.id);
         await this.bot.sendMessage(
           msg.chat.id,
-          'Привет! Используйте /setdate для установки таймера или введите дату вручную в формате /setdate YYYY-MM-DD HH:mm',
+          `✅ Таймер (ID: ${timerId}) установлен на ${eventDate.format('DD.MM.YYYY HH:mm')}!`,
         );
+      });
+    });
+
+    // Обновляем обработчик команды cleartimer для более понятного отображения
+    this.bot.onText(/\/cleartimer(?:\s+(\w+))?/, (msg, match) => {
+      this.handleErrors(async () => {
+        const timerId = match?.[1];
+        const userTimers = Array.from(this.timers.values())
+          .filter(timer => timer.chatId === msg.chat.id);
+
+        if (userTimers.length === 0) {
+          await this.bot.sendMessage(msg.chat.id, '❌ У вас нет активных таймеров');
+          return;
+        }
+
+        if (!timerId) {
+          const keyboard = userTimers.map(timer => [{
+            text: `📅 ${timer.eventDate.format('DD.MM.YYYY HH:mm')}`,
+            callback_data: `delete_timer_${timer.id}`
+          }]);
+
+          await this.bot.sendMessage(msg.chat.id, 'Выберите таймер для удаления:', {
+            reply_markup: { inline_keyboard: keyboard }
+          });
+          return;
+        }
+
+        await this.deleteTimer(timerId, msg.chat.id);
       });
     });
 
@@ -52,64 +222,7 @@ export class TelegramService implements OnModuleInit {
       });
     });
 
-    this.bot.onText(
-      /\/setdate (\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})/,
-      (msg, match) => {
-        this.handleErrors(async () => {
-          if (!match) return;
-
-          const [_, date, time] = match;
-          this.eventDate = moment.tz(
-            `${date} ${time}:00`,
-            'YYYY-MM-DD HH:mm:ss',
-            this.timezone,
-          );
-
-          this.chatId = msg.chat.id;
-
-          if (!this.eventDate.isValid()) {
-            await this.bot.sendMessage(
-              msg.chat.id,
-              'Неправильный формат даты. Используйте /setdate для выбора даты.',
-            );
-            return;
-          }
-
-          await this.bot.sendMessage(
-            msg.chat.id,
-            `Событие установлено на ${this.eventDate.format('YYYY-MM-DD HH:mm')}!`,
-          );
-          await this.startTimer();
-        });
-      },
-    );
-
-    this.bot.onText(/\/cleartimer/, (msg) => {
-      this.handleErrors(async () => {
-        if (!this.chatId || !this.pinnedMessageId) {
-          await this.bot.sendMessage(msg.chat.id, '❌ Таймер не установлен.');
-          return;
-        }
-
-        const options = {
-          reply_markup: {
-            inline_keyboard: [
-              [
-                { text: '✅ Да', callback_data: 'confirm_delete' },
-                { text: '❌ Отмена', callback_data: 'cancel_delete' },
-              ],
-            ],
-          },
-        };
-
-        await this.bot.sendMessage(
-          msg.chat.id,
-          'Вы уверены, что хотите удалить таймер?',
-          options,
-        );
-      });
-    });
-
+    // Обновляем обработчик callback_query
     this.bot.on('callback_query', (callbackQuery) => {
       this.handleErrors(async () => {
         const { data, message } = callbackQuery;
@@ -117,9 +230,23 @@ export class TelegramService implements OnModuleInit {
 
         if (!message || !data) return;
 
+        if (data.startsWith('delete_timer_')) {
+          const timerId = data.replace('delete_timer_', '');
+          await this.deleteTimer(timerId, message.chat.id);
+          // Удаляем сообщение с кнопками после выбора
+          await this.bot.deleteMessage(
+            message.chat.id,
+            message.message_id,
+          );
+          await this.bot.answerCallbackQuery(callbackQuery.id, {
+            text: '✅ Таймер удален',
+          });
+          return;
+        }
+
         if (data.startsWith('year_')) {
           const year = parseInt(data.split('_')[1]);
-          this.dateTimeState[userId].year = year;
+          this.dateTimeState[userId] = { year };
           await this.showMonthPicker(message.chat.id);
         } else if (data.startsWith('month_')) {
           const month = parseInt(data.split('_')[1]);
@@ -137,24 +264,6 @@ export class TelegramService implements OnModuleInit {
           const minute = parseInt(data.split('_')[1]);
           this.dateTimeState[userId].minute = minute;
           await this.setDateTime(message.chat.id, userId);
-        } else if (
-          data === 'confirm_delete' &&
-          this.chatId &&
-          this.pinnedMessageId
-        ) {
-          const currentChatId = this.chatId;
-          await this.bot.unpinChatMessage(currentChatId, {
-            message_id: this.pinnedMessageId,
-          });
-          this.pinnedMessageId = null;
-          this.eventDate = null;
-          this.chatId = null;
-          await this.bot.sendMessage(message.chat.id, '✅ Таймер удалён.');
-        } else if (data === 'cancel_delete') {
-          await this.bot.sendMessage(
-            message.chat.id,
-            '❌ Удаление таймера отменено.',
-          );
         }
 
         await this.bot.answerCallbackQuery(callbackQuery.id);
@@ -167,57 +276,256 @@ export class TelegramService implements OnModuleInit {
       await fn();
     } catch (error) {
       console.error('Ошибка в Telegram сервисе:', error);
-      if (this.chatId) {
-        const currentChatId = this.chatId;
+
+      // Проверяем, является ли ошибка связанной с Telegram API
+      if (error instanceof Error) {
+        // Игнорируем некоторые некритичные ошибки
+        if (
+          error.message.includes('message is not modified') ||
+          error.message.includes('message to edit not found') ||
+          error.message.includes('message to delete not found')
+        ) {
+          return;
+        }
+      }
+
+      // Для остальных ошибок - пробрасываем дальше
+      throw error;
+    }
+  }
+
+  private async restoreTimers(): Promise<void> {
+    try {
+      const savedTimers = await this.timerRepository.find({
+        where: { isRunning: true }
+      });
+
+      for (const timerData of savedTimers) {
+        const eventDate = moment(timerData.eventDate);
+        
+        // Пропускаем истекшие таймеры
+        if (eventDate.isBefore(moment())) {
+          await this.timerRepository.delete(timerData.id);
+          continue;
+        }
+
+        const timer: Timer = {
+          id: timerData.id,
+          eventDate,
+          chatId: timerData.chatId,
+          pinnedMessageId: timerData.pinnedMessageId,
+          isRunning: true
+        };
+
+        this.timers.set(timer.id, timer);
+        void this.startTimer(timer.id);
+
         try {
           await this.bot.sendMessage(
-            currentChatId,
-            '⚠️ Произошла ошибка при выполнении операции.',
+            timer.chatId,
+            `✅ Восстановлен таймер на ${timer.eventDate.format('DD.MM.YYYY HH:mm')}`
           );
-        } catch (sendError) {
-          console.error('Ошибка при отправке сообщения об ошибке:', sendError);
+        } catch (error) {
+          console.error('Ошибка при отправке уведомления о восстановлении таймера:', error);
         }
+      }
+
+      console.log(`Восстановлено ${this.timers.size} таймеров`);
+    } catch (error) {
+      console.error('Ошибка при восстановлении таймеров:', error);
+      throw error;
+    }
+  }
+
+  private async createTimer(eventDate: moment.Moment, chatId: TelegramBot.ChatId): Promise<string> {
+    const timerId = Math.random().toString(36).substr(2, 9);
+    const timer: Timer = {
+      id: timerId,
+      eventDate,
+      chatId,
+      pinnedMessageId: null,
+      isRunning: true
+    };
+
+    // Сохраняем в базу данных
+    await this.timerRepository.save({
+      id: timer.id,
+      eventDate: timer.eventDate.toDate(),
+      chatId: Number(timer.chatId),
+      pinnedMessageId: timer.pinnedMessageId,
+      isRunning: timer.isRunning
+    });
+
+    this.timers.set(timerId, timer);
+    void this.startTimer(timerId);
+    
+    return timerId;
+  }
+
+  private async deleteTimer(timerId: string, chatId: TelegramBot.ChatId): Promise<void> {
+    try {
+      const timer = this.timers.get(timerId);
+      
+      if (!timer) {
+        await this.bot.sendMessage(chatId, '❌ Таймер не найден');
+        return;
+      }
+
+      if (timer.chatId !== chatId) {
+        await this.bot.sendMessage(chatId, '❌ У вас нет доступа к этому таймеру');
+        return;
+      }
+
+      timer.isRunning = false;
+
+      if (timer.pinnedMessageId) {
+        try {
+          await this.bot.unpinChatMessage(chatId, {
+            message_id: timer.pinnedMessageId
+          });
+        } catch (error) {
+          console.error('Ошибка при откреплении сообщения:', error);
+        }
+      }
+
+      // Удаляем из базы данных
+      await this.timerRepository.delete(timerId);
+      this.timers.delete(timerId);
+
+      if (!this.bot.listenerCount('callback_query')) {
+        await this.bot.sendMessage(chatId, `✅ Таймер удален`);
+      }
+    } catch (error) {
+      console.error('Ошибка при удалении таймера:', error);
+      throw error;
+    }
+  }
+
+  private async updateTimer(timer: Timer): Promise<void> {
+    await this.timerRepository.update(timer.id, {
+      pinnedMessageId: timer.pinnedMessageId,
+      isRunning: timer.isRunning
+    });
+  }
+
+  private async startTimer(timerId: string) {
+    const timer = this.timers.get(timerId);
+    if (!timer) return;
+
+    try {
+      while (timer.isRunning && this.timers.has(timerId)) {
+        await this.handleErrors(async () => {
+          const now = moment();
+          const diff = moment.duration(timer.eventDate.diff(now));
+          const milliseconds = diff.asMilliseconds();
+
+          if (milliseconds <= 0) {
+            await this.bot.sendMessage(
+              timer.chatId,
+              `⏳ Время пришло! (Таймер ${timer.id})`,
+            );
+            if (timer.pinnedMessageId) {
+              try {
+                await this.bot.unpinChatMessage(timer.chatId, {
+                  message_id: timer.pinnedMessageId,
+                });
+              } catch (error) {
+                console.error('Ошибка при открепления сообщения:', error);
+              }
+            }
+            this.timers.delete(timerId);
+            return;
+          }
+
+          let timerText = `⏳ Таймер ${timer.id}\nОсталось: `;
+          const parts: string[] = [];
+
+          if (diff.years() > 0) {
+            parts.push(
+              `${diff.years()} ${this.pluralize(diff.years(), ['год', 'года', 'лет'])}`,
+            );
+          }
+          if (diff.months() > 0) {
+            parts.push(
+              `${diff.months()} ${this.pluralize(diff.months(), ['месяц', 'месяца', 'месяцев'])}`,
+            );
+          }
+          if (diff.days() > 0) {
+            parts.push(
+              `${diff.days()} ${this.pluralize(diff.days(), ['день', 'дня', 'дней'])}`,
+            );
+          }
+          if (diff.hours() > 0) {
+            parts.push(
+              `${diff.hours()} ${this.pluralize(diff.hours(), ['час', 'часа', 'часов'])}`,
+            );
+          }
+          if (diff.minutes() > 0) {
+            parts.push(
+              `${diff.minutes()} ${this.pluralize(diff.minutes(), ['минута', 'минуты', 'минут'])}`,
+            );
+          }
+          if (diff.seconds() > 0) {
+            parts.push(
+              `${diff.seconds()} ${this.pluralize(diff.seconds(), ['секунда', 'секунды', 'секунд'])}`,
+            );
+          }
+
+          timerText += parts.join(', ');
+
+          if (timer.pinnedMessageId) {
+            try {
+              await this.bot.editMessageText(timerText, {
+                chat_id: timer.chatId,
+                message_id: timer.pinnedMessageId,
+              });
+            } catch (error) {
+              if (
+                error instanceof Error &&
+                error.message.includes('message is not modified')
+              ) {
+                // Игнорируем ошибку о неизмененном сообщении
+              } else {
+                throw error;
+              }
+            }
+          } else {
+            const sentMessage = await this.bot.sendMessage(
+              timer.chatId,
+              timerText,
+            );
+            await this.bot.pinChatMessage(timer.chatId, sentMessage.message_id);
+            timer.pinnedMessageId = sentMessage.message_id;
+          }
+
+          await this.updateTimer(timer);
+        });
+
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+      }
+    } catch (error) {
+      console.error(`Ошибка в таймере ${timerId}:`, error);
+      try {
+        await this.bot.sendMessage(
+          timer.chatId,
+          `⚠️ Произошла ошибка в работе таймера ${timerId}. Таймер остановлен.`,
+        );
+      } catch (sendError) {
+        console.error('Ошибка при отправке сообщения об ошибке:', sendError);
+      } finally {
+        this.timers.delete(timerId);
       }
     }
   }
 
-  private async startTimer() {
-    if (!this.eventDate || !this.chatId) return;
-
-    const currentChatId = this.chatId;
-
-    while (true) {
-      await this.handleErrors(async () => {
-        const now = moment();
-        const diff = moment.duration(this.eventDate!.diff(now));
-
-        if (diff.asMilliseconds() <= 0) {
-          await this.bot.sendMessage(currentChatId, '⏳ Время пришло!');
-          this.eventDate = null;
-          return;
-        }
-
-        const timerText =
-          `⏳ Осталось: ${diff.years()} лет, ${diff.months()} месяцев, ${diff.days()} дней, ` +
-          `${diff.hours()} часов, ${diff.minutes()} минут, ${diff.seconds()} секунд`;
-
-        if (this.pinnedMessageId) {
-          await this.bot.editMessageText(timerText, {
-            chat_id: currentChatId,
-            message_id: this.pinnedMessageId,
-          });
-        } else {
-          const sentMessage = await this.bot.sendMessage(
-            currentChatId,
-            timerText,
-          );
-          await this.bot.pinChatMessage(currentChatId, sentMessage.message_id);
-          this.pinnedMessageId = sentMessage.message_id;
-        }
-      });
-
-      await new Promise((resolve) => setTimeout(resolve, 5000));
-    }
+  // Вспомогательная функция для правильного склонения слов
+  private pluralize(number: number, words: [string, string, string]): string {
+    const cases = [2, 0, 1, 1, 1, 2];
+    return words[
+      number % 100 > 4 && number % 100 < 20
+        ? 2
+        : cases[number % 10 < 5 ? number % 10 : 5]
+    ];
   }
 
   private async showYearPicker(chatId: number) {
@@ -304,10 +612,9 @@ export class TelegramService implements OnModuleInit {
   private async setDateTime(chatId: number, userId: string) {
     const state = this.dateTimeState[userId];
     const dateString = `${state.year}-${state.month}-${state.day} ${state.hour}:${state.minute}`;
-    this.eventDate = moment.tz(dateString, 'YYYY-M-D H:m', this.timezone);
-    this.chatId = chatId;
+    const eventDate = moment.tz(dateString, 'YYYY-M-D H:m', this.timezone);
 
-    if (!this.eventDate.isValid()) {
+    if (!eventDate.isValid()) {
       await this.bot.sendMessage(
         chatId,
         'Произошла ошибка при установке даты. Попробуйте еще раз.',
@@ -315,12 +622,12 @@ export class TelegramService implements OnModuleInit {
       return;
     }
 
+    const timerId = await this.createTimer(eventDate, chatId);
     await this.bot.sendMessage(
       chatId,
-      `Событие установлено на ${this.eventDate.format('YYYY-MM-DD HH:mm')}!`,
+      `✅ Таймер (ID: ${timerId}) установлен на ${eventDate.format('DD.MM.YYYY HH:mm')}!`,
     );
     delete this.dateTimeState[userId];
-    await this.startTimer();
   }
 
   private createButtonRows<T extends TelegramBot.InlineKeyboardButton>(

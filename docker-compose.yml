@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  telegram-bot:
+    container_name: telegram-bot
+    build:
+      context: .
+      target: production
+    restart: always
+    env_file:
+      - .env
+    depends_on:
+      - postgres
+    networks:
+      - bot-network
+
+  postgres:
+    container_name: telegram-bot-db
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - bot-network
+
+networks:
+  bot-network:
+    driver: bridge
+
+volumes:
+  postgres_data: 
