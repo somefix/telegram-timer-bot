@@ -13,9 +13,20 @@ sudo apt install -y \
     lsb-release \
     git
 
+# Установка Docker и Docker Compose
+curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh
+sudo usermod -aG docker $USER
+sudo apt install -y docker-compose-plugin
+
+# Перезапуск Docker и проверка статуса
+sudo systemctl restart docker
+sudo systemctl enable docker
+sudo systemctl status docker --no-pager
+
 # Создание рабочей директории
-sudo mkdir -p /opt/telegram-bot
-sudo chown $USER:$USER /opt/telegram-bot
+sudo mkdir -p /home/deploy/telegram-timer-bot
+sudo chown $USER:$USER /home/deploy/telegram-timer-bot
 
 # Настройка файрвола
 sudo ufw allow ssh
@@ -33,7 +44,7 @@ After=docker.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-WorkingDirectory=/opt/telegram-bot
+WorkingDirectory=/home/deploy/telegram-timer-bot
 ExecStart=/usr/bin/docker compose up -d
 ExecStop=/usr/bin/docker compose down
 TimeoutStartSec=0
