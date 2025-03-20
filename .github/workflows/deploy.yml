@@ -30,7 +30,7 @@ jobs:
           password: ${{ secrets.VPS_PASSWORD }}
           port: ${{ secrets.VPS_PORT }}
           source: ".,!node_modules,!postgres_data,!.git"
-          target: "/opt/telegram-bot"
+          target: "/home/deploy/telegram-timer-bot"
           strip_components: 0
 
       - name: Deploy to VPS
@@ -42,7 +42,7 @@ jobs:
           port: ${{ secrets.VPS_PORT }}
           script: |
             # Переходим в директорию проекта
-            cd /opt/telegram-bot
+            cd /home/deploy/telegram-timer-bot
 
             # Проверяем наличие docker и docker-compose
             if ! command -v docker &> /dev/null; then
