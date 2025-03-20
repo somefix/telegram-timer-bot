@@ -11,7 +11,8 @@ sudo apt install -y \
     curl \
     gnupg \
     lsb-release \
-    git
+    git \
+    ufw
 
 # Установка Docker и Docker Compose
 curl -fsSL https://get.docker.com -o get-docker.sh
