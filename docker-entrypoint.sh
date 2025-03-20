@@ -8,4 +8,7 @@ done
 
 echo "PostgreSQL started"
 
+# Запускаем миграции Prisma
+npx prisma migrate deploy
+
 exec "$@" 

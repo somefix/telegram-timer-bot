@@ -1,15 +1,13 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
+import { PrismaService } from '../prisma/prisma.service';
 import * as TelegramBot from 'node-telegram-bot-api';
 import * as moment from 'moment-timezone';
-import { TimerEntity } from './entities/timer.entity';
 
 interface Timer {
   id: string;
   eventDate: moment.Moment;
-  chatId: TelegramBot.ChatId;
+  chatId: number;
   pinnedMessageId: number | null;
   isRunning: boolean;
 }
@@ -32,10 +30,10 @@ export class TelegramService implements OnModuleInit {
 
   constructor(
     private configService: ConfigService,
-    @InjectRepository(TimerEntity)
-    private timerRepository: Repository<TimerEntity>,
+    private prisma: PrismaService,
   ) {
-    this.timezone = this.configService.get<string>('TIMEZONE') || 'Europe/Moscow';
+    this.timezone =
+      this.configService.get<string>('TIMEZONE') || 'Europe/Moscow';
   }
 
   async onModuleInit() {
@@ -126,85 +124,109 @@ export class TelegramService implements OnModuleInit {
     // Обновляем метод mytimers
     this.bot.onText(/\/mytimers/, (msg) => {
       this.handleErrors(async () => {
-        const userTimers = Array.from(this.timers.values())
-          .filter(timer => timer.chatId === msg.chat.id);
-
-        if (userTimers.length === 0) {
-          await this.bot.sendMessage(msg.chat.id, '❌ У вас нет активных таймеров');
-          return;
-        }
-
-        const timersList = userTimers.map((timer, index) => {
-          const remaining = moment.duration(timer.eventDate.diff(moment()));
-          let timeLeft = '';
-          
-          if (remaining.years() > 0) timeLeft += `${remaining.years()}г `;
-          if (remaining.months() > 0) timeLeft += `${remaining.months()}м `;
-          if (remaining.days() > 0) timeLeft += `${remaining.days()}д `;
-          if (remaining.hours() > 0) timeLeft += `${remaining.hours()}ч `;
-          if (remaining.minutes() > 0) timeLeft += `${remaining.minutes()}мин `;
-          timeLeft += `${remaining.seconds()}с`;
-
-          return `${index + 1}. 📅 ${timer.eventDate.format('DD.MM.YYYY HH:mm')}\n⏳ Осталось: ${timeLeft}`;
-        }).join('\n\n');
-
-        await this.bot.sendMessage(msg.chat.id, 
-          '📋 *Ваши активные таймеры:*\n\n' + timersList + 
-          '\n\n_Используйте /cleartimer для удаления таймера_', {
-          parse_mode: 'Markdown'
-        });
-      });
-    });
-
-    // Обновляем обработчик установки таймера
-    this.bot.onText(/\/setdate (\d{2})\.(\d{2})\.(\d{4}) (\d{2}):(\d{2})/, (msg, match) => {
-      this.handleErrors(async () => {
-        if (!match) return;
-
-        const [_, day, month, year, hours, minutes] = match;
-        const eventDate = moment.tz(
-          `${year}-${month}-${day} ${hours}:${minutes}:00`,
-          'YYYY-MM-DD HH:mm:ss',
-          this.timezone,
+        const userTimers = Array.from(this.timers.values()).filter(
+          (timer) => timer.chatId === msg.chat.id,
         );
 
-        if (!eventDate.isValid()) {
+        if (userTimers.length === 0) {
           await this.bot.sendMessage(
             msg.chat.id,
-            'Неправильный формат даты. Используйте /setdate для выбора даты или формат ДД.ММ.ГГГГ ЧЧ:ММ',
+            '❌ У вас нет активных таймеров',
           );
           return;
         }
 
-        const timerId = await this.createTimer(eventDate, msg.chat.id);
+        const timersList = userTimers
+          .map((timer, index) => {
+            const remaining = moment.duration(timer.eventDate.diff(moment()));
+            let timeLeft = '';
+
+            if (remaining.years() > 0) timeLeft += `${remaining.years()}г `;
+            if (remaining.months() > 0) timeLeft += `${remaining.months()}м `;
+            if (remaining.days() > 0) timeLeft += `${remaining.days()}д `;
+            if (remaining.hours() > 0) timeLeft += `${remaining.hours()}ч `;
+            if (remaining.minutes() > 0)
+              timeLeft += `${remaining.minutes()}мин `;
+            timeLeft += `${remaining.seconds()}с`;
+
+            return `${index + 1}. 📅 ${timer.eventDate.format('DD.MM.YYYY HH:mm')}\n⏳ Осталось: ${timeLeft}`;
+          })
+          .join('\n\n');
+
         await this.bot.sendMessage(
           msg.chat.id,
-          `✅ Таймер (ID: ${timerId}) установлен на ${eventDate.format('DD.MM.YYYY HH:mm')}!`,
+          '📋 *Ваши активные таймеры:*\n\n' +
+            timersList +
+            '\n\n_Используйте /cleartimer для удаления таймера_',
+          {
+            parse_mode: 'Markdown',
+          },
         );
       });
     });
+
+    // Обновляем обработчик установки таймера
+    this.bot.onText(
+      /\/setdate (\d{2})\.(\d{2})\.(\d{4}) (\d{2}):(\d{2})/,
+      (msg, match) => {
+        this.handleErrors(async () => {
+          if (!match) return;
+
+          const [_, day, month, year, hours, minutes] = match;
+          const eventDate = moment.tz(
+            `${year}-${month}-${day} ${hours}:${minutes}:00`,
+            'YYYY-MM-DD HH:mm:ss',
+            this.timezone,
+          );
+
+          if (!eventDate.isValid()) {
+            await this.bot.sendMessage(
+              msg.chat.id,
+              'Неправильный формат даты. Используйте /setdate для выбора даты или формат ДД.ММ.ГГГГ ЧЧ:ММ',
+            );
+            return;
+          }
+
+          const timerId = await this.createTimer(eventDate, msg.chat.id);
+          await this.bot.sendMessage(
+            msg.chat.id,
+            `✅ Таймер (ID: ${timerId}) установлен на ${eventDate.format('DD.MM.YYYY HH:mm')}!`,
+          );
+        });
+      },
+    );
 
     // Обновляем обработчик команды cleartimer для более понятного отображения
     this.bot.onText(/\/cleartimer(?:\s+(\w+))?/, (msg, match) => {
       this.handleErrors(async () => {
         const timerId = match?.[1];
-        const userTimers = Array.from(this.timers.values())
-          .filter(timer => timer.chatId === msg.chat.id);
+        const userTimers = Array.from(this.timers.values()).filter(
+          (timer) => timer.chatId === msg.chat.id,
+        );
 
         if (userTimers.length === 0) {
-          await this.bot.sendMessage(msg.chat.id, '❌ У вас нет активных таймеров');
+          await this.bot.sendMessage(
+            msg.chat.id,
+            '❌ У вас нет активных таймеров',
+          );
           return;
         }
 
         if (!timerId) {
-          const keyboard = userTimers.map(timer => [{
-            text: `📅 ${timer.eventDate.format('DD.MM.YYYY HH:mm')}`,
-            callback_data: `delete_timer_${timer.id}`
-          }]);
+          const keyboard = userTimers.map((timer) => [
+            {
+              text: `📅 ${timer.eventDate.format('DD.MM.YYYY HH:mm')}`,
+              callback_data: `delete_timer_${timer.id}`,
+            },
+          ]);
 
-          await this.bot.sendMessage(msg.chat.id, 'Выберите таймер для удаления:', {
-            reply_markup: { inline_keyboard: keyboard }
-          });
+          await this.bot.sendMessage(
+            msg.chat.id,
+            'Выберите таймер для удаления:',
+            {
+              reply_markup: { inline_keyboard: keyboard },
+            },
+          );
           return;
         }
 
@@ -234,10 +256,7 @@ export class TelegramService implements OnModuleInit {
           const timerId = data.replace('delete_timer_', '');
           await this.deleteTimer(timerId, message.chat.id);
           // Удаляем сообщение с кнопками после выбора
-          await this.bot.deleteMessage(
-            message.chat.id,
-            message.message_id,
-          );
+          await this.bot.deleteMessage(message.chat.id, message.message_id);
           await this.bot.answerCallbackQuery(callbackQuery.id, {
             text: '✅ Таймер удален',
           });
@@ -296,25 +315,27 @@ export class TelegramService implements OnModuleInit {
 
   private async restoreTimers(): Promise<void> {
     try {
-      const savedTimers = await this.timerRepository.find({
-        where: { isRunning: true }
+      const savedTimers = await this.prisma.timer.findMany({
+        where: { isRunning: true },
       });
 
       for (const timerData of savedTimers) {
         const eventDate = moment(timerData.eventDate);
-        
+
         // Пропускаем истекшие таймеры
         if (eventDate.isBefore(moment())) {
-          await this.timerRepository.delete(timerData.id);
+          await this.prisma.timer.delete({
+            where: { id: timerData.id },
+          });
           continue;
         }
 
         const timer: Timer = {
-          id: timerData.id,
           eventDate,
-          chatId: timerData.chatId,
+          id: timerData.id,
+          chatId: Number(timerData.chatId),
           pinnedMessageId: timerData.pinnedMessageId,
-          isRunning: true
+          isRunning: true,
         };
 
         this.timers.set(timer.id, timer);
@@ -323,10 +344,13 @@ export class TelegramService implements OnModuleInit {
         try {
           await this.bot.sendMessage(
             timer.chatId,
-            `✅ Восстановлен таймер на ${timer.eventDate.format('DD.MM.YYYY HH:mm')}`
+            `✅ Восстановлен таймер на ${timer.eventDate.format('DD.MM.YYYY HH:mm')}`,
           );
         } catch (error) {
-          console.error('Ошибка при отправке уведомления о восстановлении таймера:', error);
+          console.error(
+            'Ошибка при отправке уведомления о восстановлении таймера:',
+            error,
+          );
         }
       }
 
@@ -337,42 +361,53 @@ export class TelegramService implements OnModuleInit {
     }
   }
 
-  private async createTimer(eventDate: moment.Moment, chatId: TelegramBot.ChatId): Promise<string> {
+  private async createTimer(
+    eventDate: moment.Moment,
+    chatId: TelegramBot.ChatId,
+  ): Promise<string> {
     const timerId = Math.random().toString(36).substr(2, 9);
     const timer: Timer = {
       id: timerId,
       eventDate,
-      chatId,
+      chatId: Number(chatId),
       pinnedMessageId: null,
-      isRunning: true
+      isRunning: true,
     };
 
-    // Сохраняем в базу данных
-    await this.timerRepository.save({
-      id: timer.id,
-      eventDate: timer.eventDate.toDate(),
-      chatId: Number(timer.chatId),
-      pinnedMessageId: timer.pinnedMessageId,
-      isRunning: timer.isRunning
+    // Сохраняем в базу данных через Prisma
+    await this.prisma.timer.create({
+      data: {
+        id: timer.id,
+        eventDate: timer.eventDate.toDate(),
+        chatId: Number(timer.chatId),
+        pinnedMessageId: timer.pinnedMessageId,
+        isRunning: timer.isRunning,
+      },
     });
 
     this.timers.set(timerId, timer);
     void this.startTimer(timerId);
-    
+
     return timerId;
   }
 
-  private async deleteTimer(timerId: string, chatId: TelegramBot.ChatId): Promise<void> {
+  private async deleteTimer(
+    timerId: string,
+    chatId: TelegramBot.ChatId,
+  ): Promise<void> {
     try {
       const timer = this.timers.get(timerId);
-      
+
       if (!timer) {
         await this.bot.sendMessage(chatId, '❌ Таймер не найден');
         return;
       }
 
       if (timer.chatId !== chatId) {
-        await this.bot.sendMessage(chatId, '❌ У вас нет доступа к этому таймеру');
+        await this.bot.sendMessage(
+          chatId,
+          '❌ У вас нет доступа к этому таймеру',
+        );
         return;
       }
 
@@ -381,15 +416,17 @@ export class TelegramService implements OnModuleInit {
       if (timer.pinnedMessageId) {
         try {
           await this.bot.unpinChatMessage(chatId, {
-            message_id: timer.pinnedMessageId
+            message_id: timer.pinnedMessageId,
           });
         } catch (error) {
           console.error('Ошибка при откреплении сообщения:', error);
         }
       }
 
-      // Удаляем из базы данных
-      await this.timerRepository.delete(timerId);
+      // Удаляем из базы данных через Prisma
+      await this.prisma.timer.delete({
+        where: { id: timerId },
+      });
       this.timers.delete(timerId);
 
       if (!this.bot.listenerCount('callback_query')) {
@@ -402,9 +439,12 @@ export class TelegramService implements OnModuleInit {
   }
 
   private async updateTimer(timer: Timer): Promise<void> {
-    await this.timerRepository.update(timer.id, {
-      pinnedMessageId: timer.pinnedMessageId,
-      isRunning: timer.isRunning
+    await this.prisma.timer.update({
+      where: { id: timer.id },
+      data: {
+        pinnedMessageId: timer.pinnedMessageId,
+        isRunning: timer.isRunning,
+      },
     });
   }
 
