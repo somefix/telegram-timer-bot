@@ -418,8 +418,9 @@ export class TelegramService implements OnModuleInit {
           await this.bot.unpinChatMessage(chatId, {
             message_id: timer.pinnedMessageId,
           });
+          await this.bot.deleteMessage(chatId, timer.pinnedMessageId);
         } catch (error) {
-          console.error('Ошибка при откреплении сообщения:', error);
+          console.error('Ошибка при откреплении/удалении сообщения:', error);
         }
       }
 
@@ -460,19 +461,17 @@ export class TelegramService implements OnModuleInit {
           const milliseconds = diff.asMilliseconds();
 
           if (milliseconds <= 0) {
-            await this.bot.sendMessage(
-              timer.chatId,
-              `⏳ Время пришло! (Таймер ${timer.id})`,
-            );
             if (timer.pinnedMessageId) {
               try {
                 await this.bot.unpinChatMessage(timer.chatId, {
                   message_id: timer.pinnedMessageId,
                 });
+                await this.bot.deleteMessage(timer.chatId, timer.pinnedMessageId);
               } catch (error) {
-                console.error('Ошибка при открепления сообщения:', error);
+                console.error('Ошибка при откреплении/удалении сообщения:', error);
               }
             }
+            await this.bot.sendMessage(timer.chatId, `⏳ Время пришло! (Таймер ${timer.id})`);
             this.timers.delete(timerId);
             return;
           }
