@@ -330,27 +330,44 @@ export class TelegramService implements OnModuleInit {
           continue;
         }
 
-        const timer: Timer = {
-          eventDate,
-          id: timerData.id,
-          chatId: Number(timerData.chatId),
-          pinnedMessageId: timerData.pinnedMessageId,
-          isRunning: true,
-        };
-
-        this.timers.set(timer.id, timer);
-        void this.startTimer(timer.id);
-
         try {
-          await this.bot.sendMessage(
-            timer.chatId,
-            `✅ Восстановлен таймер на ${timer.eventDate.format('DD.MM.YYYY HH:mm')}`,
+          // Проверяем права бота для данного чата
+          const chatMember = await this.bot.getChatMember(
+            timerData.chatId,
+            (await this.bot.getMe()).id
           );
+          const canPin = chatMember.can_pin_messages;
+
+          if (!canPin) {
+            // Если нет прав - тихо удаляем таймер
+            await this.prisma.timer.delete({
+              where: { id: timerData.id },
+            });
+            continue;
+          }
+
+          // Если права есть - восстанавливаем таймер
+          const timer: Timer = {
+            eventDate,
+            id: timerData.id,
+            chatId: Number(timerData.chatId),
+            pinnedMessageId: timerData.pinnedMessageId,
+            isRunning: true,
+          };
+
+          this.timers.set(timer.id, timer);
+          void this.startTimer(timer.id);
         } catch (error) {
+          // Если произошла ошибка при проверке прав (например, бот удален из чата)
+          // тоже тихо удаляем таймер
+          await this.prisma.timer.delete({
+            where: { id: timerData.id },
+          });
           console.error(
-            'Ошибка при отправке уведомления о восстановлении таймера:',
-            error,
+            `Ошибка при проверке прав для таймера ${timerData.id}:`,
+            error
           );
+          continue;
         }
       }
 
@@ -379,10 +396,18 @@ export class TelegramService implements OnModuleInit {
           'После этого попробуйте создать таймер снова.',
           { parse_mode: 'Markdown' }
         );
-        return '';
+        throw new Error('Недостаточно прав для создания таймера');
       }
     } catch (error) {
+      if (error instanceof Error && error.message === 'Недостаточно прав для создания таймера') {
+        throw error;
+      }
       console.error('Ошибка при проверке прав бота:', error);
+      await this.bot.sendMessage(
+        chatId,
+        '❌ Произошла ошибка при проверке прав. Попробуйте позже.',
+      );
+      throw error;
     }
 
     // Отправляем сообщение с лоадером
@@ -789,19 +814,25 @@ export class TelegramService implements OnModuleInit {
 
     try {
       const timerId = await this.createTimer(eventDate, chatId);
-      await this.bot.sendMessage(
-        chatId,
-        `✅ Таймер (ID: ${timerId}) установлен на ${eventDate.format('DD.MM.YYYY HH:mm')}!`,
-      );
+      if (timerId) { // Проверяем, что таймер был создан
+        await this.bot.sendMessage(
+          chatId,
+          `✅ Таймер (ID: ${timerId}) установлен на ${eventDate.format('DD.MM.YYYY HH:mm')}!`,
+        );
+      }
     } catch (error) {
-      await this.bot.sendMessage(
-        chatId,
-        '❌ Произошла ошибка при создании таймера. Попробуйте еще раз.',
-      );
-      console.error('Ошибка при создании таймера:', error);
+      if (error instanceof Error && error.message === 'Недостаточно прав для создания таймера') {
+        // Ничего не делаем, так как сообщение об ошибке уже отправлено в createTimer
+      } else {
+        await this.bot.sendMessage(
+          chatId,
+          '❌ Произошла ошибка при создании таймера. Попробуйте еще раз.',
+        );
+        console.error('Ошибка при создании таймера:', error);
+      }
+    } finally {
+      delete this.dateTimeState[userId];
     }
-    
-    delete this.dateTimeState[userId];
   }
 
   private createButtonRows<T extends TelegramBot.InlineKeyboardButton>(
