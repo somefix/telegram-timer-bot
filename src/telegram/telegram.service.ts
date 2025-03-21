@@ -365,30 +365,87 @@ export class TelegramService implements OnModuleInit {
     eventDate: moment.Moment,
     chatId: TelegramBot.ChatId,
   ): Promise<string> {
-    const timerId = Math.random().toString(36).substr(2, 9);
-    const timer: Timer = {
-      id: timerId,
-      eventDate,
-      chatId: Number(chatId),
-      pinnedMessageId: null,
-      isRunning: true,
-    };
+    // Проверяем права бота перед созданием таймера
+    try {
+      const chatMember = await this.bot.getChatMember(chatId, (await this.bot.getMe()).id);
+      const canPin = chatMember.can_pin_messages;
+      
+      if (!canPin) {
+        await this.bot.sendMessage(
+          chatId,
+          '⚠️ Для корректной работы таймеров, пожалуйста:\n' +
+          '1. Сделайте бота администратором группы\n' +
+          '2. Включите право "Закреплять сообщения"\n\n' +
+          'После этого попробуйте создать таймер снова.',
+          { parse_mode: 'Markdown' }
+        );
+        return '';
+      }
+    } catch (error) {
+      console.error('Ошибка при проверке прав бота:', error);
+    }
 
-    // Сохраняем в базу данных через Prisma
-    await this.prisma.timer.create({
-      data: {
-        id: timer.id,
-        eventDate: timer.eventDate.toDate(),
-        chatId: Number(timer.chatId),
-        pinnedMessageId: timer.pinnedMessageId,
-        isRunning: timer.isRunning,
-      },
-    });
+    // Отправляем сообщение с лоадером
+    const loadingMessage = await this.bot.sendMessage(
+      chatId,
+      '⏳ Создаю таймер...',
+    );
 
-    this.timers.set(timerId, timer);
-    void this.startTimer(timerId);
+    try {
+      const timerId = Math.random().toString(36).substr(2, 9);
+      const timer: Timer = {
+        id: timerId,
+        eventDate,
+        chatId: Number(chatId),
+        pinnedMessageId: null,
+        isRunning: true,
+      };
 
-    return timerId;
+      // Анимация загрузки
+      const loadingStates = ['⏳', '⌛️'];
+      let currentState = 0;
+      const loadingInterval = setInterval(async () => {
+        try {
+          await this.bot.editMessageText(
+            `${loadingStates[currentState]} Создаю таймер...`,
+            {
+              chat_id: chatId,
+              message_id: loadingMessage.message_id,
+            },
+          );
+          currentState = (currentState + 1) % loadingStates.length;
+        } catch (error) {
+          // Игнорируем ошибки анимации
+        }
+      }, 500);
+
+      // Сохраняем в базу данных через Prisma
+      await this.prisma.timer.create({
+        data: {
+          id: timer.id,
+          eventDate: timer.eventDate.toDate(),
+          chatId: Number(timer.chatId),
+          pinnedMessageId: timer.pinnedMessageId,
+          isRunning: timer.isRunning,
+        },
+      });
+
+      this.timers.set(timerId, timer);
+      void this.startTimer(timerId);
+
+      // Останавливаем анимацию и удаляем сообщение с лоадером
+      clearInterval(loadingInterval);
+      await this.bot.deleteMessage(chatId, loadingMessage.message_id);
+
+      return timerId;
+    } catch (error) {
+      // В случае ошибки меняем сообщение на ошибку
+      await this.bot.editMessageText('❌ Ошибка при создании таймера', {
+        chat_id: chatId,
+        message_id: loadingMessage.message_id,
+      });
+      throw error;
+    }
   }
 
   private async deleteTimer(
@@ -460,7 +517,6 @@ export class TelegramService implements OnModuleInit {
           const diff = moment.duration(timer.eventDate.diff(now));
           const milliseconds = diff.asMilliseconds();
 
-          // Добавляем проверку и очистку устаревших таймеров
           await this.cleanupExpiredTimers(timer.chatId);
 
           if (milliseconds <= 0) {
@@ -532,12 +588,30 @@ export class TelegramService implements OnModuleInit {
               }
             }
           } else {
-            const sentMessage = await this.bot.sendMessage(
-              timer.chatId,
-              timerText,
-            );
-            await this.bot.pinChatMessage(timer.chatId, sentMessage.message_id);
-            timer.pinnedMessageId = sentMessage.message_id;
+            try {
+              const sentMessage = await this.bot.sendMessage(
+                timer.chatId,
+                timerText,
+              );
+              await this.bot.pinChatMessage(timer.chatId, sentMessage.message_id);
+              timer.pinnedMessageId = sentMessage.message_id;
+            } catch (error) {
+              if (error instanceof Error && error.message.includes('not enough rights')) {
+                // Если нет прав на закрепление, отправляем уведомление
+                await this.bot.sendMessage(
+                  timer.chatId,
+                  '⚠️ Для корректной работы таймеров, пожалуйста:\n' +
+                  '1. Сделайте бота администратором группы\n' +
+                  '2. Включите право "Закреплять сообщения"',
+                  { parse_mode: 'Markdown' }
+                );
+                // Останавливаем таймер
+                timer.isRunning = false;
+                this.timers.delete(timerId);
+                return;
+              }
+              throw error;
+            }
           }
 
           await this.updateTimer(timer);
@@ -713,11 +787,20 @@ export class TelegramService implements OnModuleInit {
       return;
     }
 
-    const timerId = await this.createTimer(eventDate, chatId);
-    await this.bot.sendMessage(
-      chatId,
-      `✅ Таймер (ID: ${timerId}) установлен на ${eventDate.format('DD.MM.YYYY HH:mm')}!`,
-    );
+    try {
+      const timerId = await this.createTimer(eventDate, chatId);
+      await this.bot.sendMessage(
+        chatId,
+        `✅ Таймер (ID: ${timerId}) установлен на ${eventDate.format('DD.MM.YYYY HH:mm')}!`,
+      );
+    } catch (error) {
+      await this.bot.sendMessage(
+        chatId,
+        '❌ Произошла ошибка при создании таймера. Попробуйте еще раз.',
+      );
+      console.error('Ошибка при создании таймера:', error);
+    }
+    
     delete this.dateTimeState[userId];
   }
 
