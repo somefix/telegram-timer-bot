@@ -460,6 +460,9 @@ export class TelegramService implements OnModuleInit {
           const diff = moment.duration(timer.eventDate.diff(now));
           const milliseconds = diff.asMilliseconds();
 
+          // Добавляем проверку и очистку устаревших таймеров
+          await this.cleanupExpiredTimers(timer.chatId);
+
           if (milliseconds <= 0) {
             if (timer.pinnedMessageId) {
               try {
@@ -554,6 +557,55 @@ export class TelegramService implements OnModuleInit {
       } finally {
         this.timers.delete(timerId);
       }
+    }
+  }
+
+  // Добавляем новый метод для очистки устаревших таймеров
+  private async cleanupExpiredTimers(chatId: number): Promise<void> {
+    try {
+      // Получаем все таймеры для данного чата
+      const chatTimers = Array.from(this.timers.values()).filter(
+        (timer) => timer.chatId === chatId
+      );
+
+      const now = moment();
+      
+      // Проверяем каждый таймер
+      for (const timer of chatTimers) {
+        // Если таймер истек или не запущен
+        if (!timer.isRunning || timer.eventDate.isBefore(now)) {
+          if (timer.pinnedMessageId) {
+            try {
+              // Открепляем и удаляем сообщение
+              await this.bot.unpinChatMessage(chatId, {
+                message_id: timer.pinnedMessageId,
+              });
+              await this.bot.deleteMessage(chatId, timer.pinnedMessageId);
+            } catch (error) {
+              // Игнорируем ошибки, если сообщение уже удалено
+              if (
+                error instanceof Error &&
+                !error.message.includes('message to delete not found') &&
+                !error.message.includes('message to unpin not found')
+              ) {
+                console.error('Ошибка при очистке устаревшего таймера:', error);
+              }
+            }
+          }
+          
+          // Удаляем таймер из базы данных и из памяти
+          try {
+            await this.prisma.timer.delete({
+              where: { id: timer.id },
+            });
+            this.timers.delete(timer.id);
+          } catch (error) {
+            console.error('Ошибка при удалении таймера из БД:', error);
+          }
+        }
+      }
+    } catch (error) {
+      console.error('Ошибка при очистке устаревших таймеров:', error);
     }
   }
 
